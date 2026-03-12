@@ -10,12 +10,13 @@ from scipy.io.wavfile import write
 from env import AttrDict
 from meldataset import MAX_WAV_VALUE
 from models import Generator
+import meldataset
 import librosa
 
 # -----------------------------------------------------------------------------
 # Safe cuDNN settings
 # -----------------------------------------------------------------------------
-torch.backends.cudnn.enabled = False 
+torch.backends.cudnn.enabled = False
 torch.backends.cudnn.benchmark = False
 torch.backends.cudnn.deterministic = False
 torch.backends.cudnn.allow_tf32 = False
@@ -33,35 +34,46 @@ def load_checkpoint(filepath, device):
     print("Complete.")
     return checkpoint_dict
 
+
 def scan_checkpoint(cp_dir, prefix):
     pattern = os.path.join(cp_dir, prefix + '*')
     cp_list = glob.glob(pattern)
     if len(cp_list) == 0:
         return ''
     return sorted(cp_list)[-1]
-    
+
+
 def get_mel_from_audio(wav_path, sr=22050, n_fft=1024, hop_length=256, win_length=1024, n_mels=80):
     """
-    Calculate mel spectrogram from a wav file and display it
+    Load a wav file and compute its mel spectrogram.
+    Returns a tensor of shape [1, n_mels, T].
     """
     y, orig_sr = librosa.load(wav_path, sr=None)
     if orig_sr != sr:
-        print(orig_sr)
+        print(f"Resampling from {orig_sr} to {sr}")
         y = librosa.resample(y, orig_sr=orig_sr, target_sr=sr)
-    
-    mel_spec = librosa.feature.melspectrogram(
-        y=y, sr=sr, n_fft=n_fft, hop_length=hop_length,
-        win_length=win_length, n_mels=n_mels
+
+    # mel_spectrogram expects [1, T] float tensor
+    mel_spec = meldataset.mel_spectrogram(
+        torch.from_numpy(y).float().unsqueeze(0),  # [1, T]
+        n_fft=n_fft,
+        num_mels=n_mels,
+        sampling_rate=sr,
+        hop_size=hop_length,
+        win_size=win_length,
+        fmin=0,
+        fmax=8000
     )
-    mel_spec = np.log(np.clip(mel_spec, 1e-5, None))
-    
+    # mel_spec shape: [1, n_mels, T] — return as-is
     return mel_spec
+
 
 # -----------------------------------------------------------------------------
 # Inference function
 # -----------------------------------------------------------------------------
 def inference(a):
     torch.cuda.empty_cache()
+    print(h)
     generator = Generator(h).to(device)
     state_dict_g = load_checkpoint(a.checkpoint_file, device)
     generator.load_state_dict(state_dict_g['generator'])
@@ -73,15 +85,13 @@ def inference(a):
 
     with torch.no_grad():
         for filname in filelist:
-            # Load MEL
-            # for wav->mel->wive pipeline:
+            # Load MEL from wav — returns tensor of shape [1, n_mels, T]
             x = get_mel_from_audio(os.path.join(a.input_mels_dir, filname))
-            
-            # x = np.load(os.path.join(a.input_mels_dir, filname)).astype(np.float32)
-            # x = x.T[np.newaxis, :, :]  # [1, n_mels, T]
-            x = x[np.newaxis, :, :]  # [1, n_mels, T]
-            x = torch.from_numpy(x).to(device)
-            
+
+            # x is already a tensor with batch dim — just send to device
+            x = x.to(device)
+
+            # Move everything to CPU for inference
             x = x.cpu()
             generator = generator.cpu()
 
@@ -91,19 +101,36 @@ def inference(a):
             audio = audio.cpu().numpy().astype('int16')
 
             # Save WAV
-            output_file = os.path.join(a.output_dir, os.path.splitext(filname)[0] + '_generated_e2e.wav')
+            output_file = os.path.join(
+                a.output_dir,
+                os.path.splitext(filname)[0] + '_generated_e2e.wav'
+            )
             write(output_file, h.sampling_rate, audio)
             print(f"Saved: {output_file}")
+
 
 # -----------------------------------------------------------------------------
 # Main entry
 # -----------------------------------------------------------------------------
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--input_mels_dir', default='/home/ibrahim/english_tts/Ten_Wavs_HiFi_Dataset/12787_other')
-    parser.add_argument('--output_dir', default='/home/ibrahim/english_tts/hifigan_test_demo_github/generated_wavs_hifi_dataset/12787_other')
+    parser.add_argument('--input_root_dir', required=False,
+                        default="/home/ibrahim/english_tts/hifigan-demo/Ten_Wavs_HiFi_Dataset")
+    parser.add_argument('--output_root_dir', required=False,
+                        default="/home/ibrahim/english_tts/hifigan-demo/generated_wavs_hifi_dataset")
     parser.add_argument('--checkpoint_file', required=True)
     a = parser.parse_args()
+
+    # Collect all subfolders
+    input_subfolders = [
+        os.path.join(a.input_root_dir, subfolder)
+        for subfolder in os.listdir(a.input_root_dir)
+        if os.path.isdir(os.path.join(a.input_root_dir, subfolder))
+    ]
+    output_subfolders = [
+        os.path.join(a.output_root_dir, os.path.basename(subfolder))
+        for subfolder in input_subfolders
+    ]
 
     # Load config
     config_file = os.path.join(os.path.split(a.checkpoint_file)[0], 'config.json')
@@ -116,8 +143,14 @@ def main():
     torch.manual_seed(h.seed)
     if device.type == 'cuda':
         torch.cuda.manual_seed(h.seed)
-    # print(torch.cuda.memory_summary(device=None, abbreviated=True))
-    inference(a)
+
+    for input_dir, output_dir in zip(input_subfolders, output_subfolders):
+        os.makedirs(output_dir, exist_ok=True)
+        a.input_mels_dir = input_dir
+        a.output_dir = output_dir
+        print(f"Processing folder: {input_dir}")
+        inference(a)
+
 
 if __name__ == '__main__':
     main()
